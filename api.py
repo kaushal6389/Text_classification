@@ -12,6 +12,7 @@ import pickle
 import uvicorn
 from datetime import datetime
 import os
+from scipy.sparse import hstack
 
 # Load model on startup using lifespan
 model_artifacts = None
@@ -107,14 +108,42 @@ class HealthResponse(BaseModel):
     timestamp: str
 
 # Helper function
+def check_for_abuse(text: str, abuse_words: list) -> tuple:
+    """Check if text contains abuse/profanity"""
+    text_lower = text.lower()
+    for word in abuse_words:
+        if word in text_lower:
+            return True, word
+    return False, None
+
 def predict_text(text: str) -> dict:
     """Predict category for a single text"""
     if not model_artifacts:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
-        # Vectorize
-        vectorized = model_artifacts['vectorizer'].transform([text])
+        text_lower = text.lower()
+        warnings = []
+        
+        # Check model type
+        model_type = model_artifacts.get('model_type', 'legacy')
+        
+        if model_type == 'context_aware_dual_vectorizer':
+            # New context-aware model with dual vectorization
+            
+            # Check for abuse first
+            abuse_words = model_artifacts.get('abuse_words', [])
+            has_abuse, abuse_word = check_for_abuse(text, abuse_words)
+            if has_abuse:
+                warnings.append(f"Detected potentially inappropriate content")
+            
+            # Vectorize with both word and char vectorizers
+            word_vec = model_artifacts['word_vectorizer'].transform([text_lower])
+            char_vec = model_artifacts['char_vectorizer'].transform([text_lower])
+            vectorized = hstack([word_vec, char_vec])
+        else:
+            # Legacy model with single vectorizer
+            vectorized = model_artifacts['vectorizer'].transform([text_lower])
         
         # Predict
         prediction = model_artifacts['model'].predict(vectorized)[0]
@@ -124,7 +153,8 @@ def predict_text(text: str) -> dict:
         result = {
             'category': label,
             'confidence': None,
-            'all_probabilities': None
+            'all_probabilities': None,
+            'warnings': warnings
         }
         
         if hasattr(model_artifacts['model'], 'predict_proba'):
@@ -136,6 +166,10 @@ def predict_text(text: str) -> dict:
                 model_artifacts['label_encoder'].classes_[i]: float(proba[i] * 100)
                 for i in range(len(proba))
             }
+            
+            # Add warning for low confidence
+            if result['confidence'] < 50:
+                warnings.append("Low confidence prediction")
         
         return result
     except Exception as e:
@@ -169,11 +203,21 @@ async def model_info():
     if not model_artifacts:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
+    model_type = model_artifacts.get('model_type', 'legacy')
+    
+    # Calculate feature count based on model type
+    if model_type == 'context_aware_dual_vectorizer':
+        word_features = len(model_artifacts.get('word_vectorizer', {}).get_feature_names_out() if hasattr(model_artifacts.get('word_vectorizer', {}), 'get_feature_names_out') else [])
+        char_features = len(model_artifacts.get('char_vectorizer', {}).get_feature_names_out() if hasattr(model_artifacts.get('char_vectorizer', {}), 'get_feature_names_out') else [])
+        feature_count = word_features + char_features
+    else:
+        feature_count = model_artifacts.get('feature_count', 0)
+    
     return {
         "model_name": model_artifacts['model_name'],
         "accuracy": round(model_artifacts['accuracy'] * 100, 2),
-        "feature_count": model_artifacts['feature_count'],
-        "training_samples": model_artifacts['training_samples'],
+        "feature_count": feature_count,
+        "training_samples": model_artifacts.get('training_samples', 0),
         "supported_languages": [
             "English", "Hindi", "Bengali", "Marathi", "Telugu",
             "Tamil", "Gujarati", "Urdu", "Kannada", "Odia", "Malayalam"
